@@ -1,113 +1,119 @@
 import streamlit as st
 from PIL import Image
-import tensorflow as tf
 import numpy as np
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
 from gtts import gTTS
-from io import BytesIO
 import tempfile
 import os
+import base64
+
+# TensorFlow Lite runtime (much lighter!)
+import tflite_runtime.interpreter as tflite
 
 # Page configuration
 st.set_page_config(page_title="Currency Classifier", layout="centered", initial_sidebar_state="collapsed")
 
 # Custom CSS for better styling
 st.markdown("""
-    <style>
-    .main {
-        padding-top: 2rem;
+<style>
+    body {
+        font-family: 'Arial', sans-serif;
     }
-    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-        font-size: 1.1rem;
+    .metric-container {
+        padding: 20px;
+        border-radius: 10px;
+        background-color: #f0f2f6;
+        text-align: center;
     }
-    </style>
-    """, unsafe_allow_html=True)
+    h1 {
+        color: #1f77b4;
+        text-align: center;
+    }
+    h3 {
+        color: #333;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Initialize session state
-if 'model' not in st.session_state:
-    st.session_state.model = load_model('best_currency_classifier.h5')
-    st.session_state.image_size = 224
-    st.session_state.class_names = ['10', '20', '50', '100', '200', '500']
-    st.session_state.hindi_numbers = {
-        '10': 'दस',
-        '20': 'बीस',
-        '50': 'पचास',
-        '100': 'सौ',
-        '200': 'दो सौ',
-        '500': 'पाँच सौ'
+@st.cache_resource
+def load_model():
+    """Load TensorFlow Lite model"""
+    interpreter = tflite.Interpreter(model_path="best_currency_classifier.tflite")
+    interpreter.allocate_tensors()
+    return interpreter
+
+@st.cache_resource
+def get_session_state():
+    """Initialize session state"""
+    return {
+        'image_size': 224,
+        'class_names': ['10', '20', '50', '100', '200', '500'],
+        'hindi_numbers': {
+            '10': 'दस',
+            '20': 'बीस',
+            '50': 'पचास',
+            '100': 'सौ',
+            '200': 'दो सौ',
+            '500': 'पांच सौ'
+        }
     }
 
 def preprocess_image(img_array):
-    """Enhanced preprocessing for Indian currency notes - SAME AS TKINTER GUI"""
-    # Convert to float32 for better precision
-    img = img_array.astype(np.float32)
+    """Apply histogram equalization preprocessing"""
+    from skimage.exposure import equalize_adapthist
     
-    # Normalize to [0, 1]
-    img = img / 255.0
+    # Ensure image is float32 in range [0, 1]
+    if img_array.max() > 1:
+        img_array = img_array / 255.0
     
-    # Apply adaptive histogram equalization for better contrast
+    # Apply histogram equalization per channel
+    processed = np.zeros_like(img_array)
     for channel in range(3):
-        img_channel = img[:, :, channel]
-        p2, p98 = np.percentile(img_channel, (2, 98))
-        img[:, :, channel] = np.clip(img_channel, p2, p98)
-        img[:, :, channel] = (img_channel - p2) / (p98 - p2 + 1e-7)
+        processed[:, :, channel] = equalize_adapthist(img_array[:, :, channel], clip_limit=0.03)
     
-    # Ensure values are in [0, 1]
-    img = np.clip(img, 0, 1)
+    # Clip to [0.02, 0.98] percentile and normalize
+    p2, p98 = np.percentile(processed, (2, 98))
+    processed = np.clip(processed, p2, p98)
+    processed = (processed - processed.min()) / (processed.max() - processed.min() + 1e-6)
     
-    return img
+    return processed
 
 def predict_currency(image_path):
-    """Make prediction on the image"""
+    """Make prediction on the image using TFLite"""
     try:
-        # Handle both file paths and file objects
-        if isinstance(image_path, str):
-            img = load_img(image_path, target_size=(st.session_state.image_size, st.session_state.image_size))
-            img_array = img_to_array(img)
-        else:
-            # It's a file-like object from Streamlit - use Keras load_img for consistency
-            import tempfile
-            import os
-            
-            # Get file extension from the uploaded file
-            file_name = image_path.name if hasattr(image_path, 'name') else 'image.jpg'
-            file_ext = os.path.splitext(file_name)[1] if file_name else '.jpg'
-            
-            # Save uploaded file to temporary location with correct extension
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-                tmp.write(image_path.getbuffer())
-                tmp_path = tmp.name
-            
-            # Load using Keras (SAME AS TKINTER)
-            img = load_img(tmp_path, target_size=(st.session_state.image_size, st.session_state.image_size))
-            img_array = img_to_array(img)
-            
-            # Cleanup
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
+        interpreter = load_model()
+        session_state = get_session_state()
         
-        # Apply enhanced preprocessing (SAME AS TKINTER)
+        # Load image using PIL
+        img = Image.open(image_path).convert('RGB')
+        img = img.resize((session_state['image_size'], session_state['image_size']))
+        img_array = np.array(img, dtype=np.float32)
+        
+        # Apply preprocessing
         processed_img = preprocess_image(img_array)
-        img_array = np.expand_dims(processed_img, axis=0)
+        img_array = np.expand_dims(processed_img, axis=0).astype(np.float32)
         
-        # Get predictions - model already outputs probabilities!
-        predictions_raw = st.session_state.model.predict(img_array, verbose=0)[0]
+        # Get input and output tensors
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        # Set input tensor
+        interpreter.set_tensor(input_details[0]['index'], img_array)
+        interpreter.invoke()
+        
+        # Get predictions
+        predictions_raw = interpreter.get_tensor(output_details[0]['index'])[0]
         
         predicted_class = np.argmax(predictions_raw)
         
-        # Get sorted predictions with proper indexing
+        # Get sorted predictions
         sorted_indices = np.argsort(predictions_raw)[::-1]
         
         # Top 2 difference
         top_2_diff = predictions_raw[sorted_indices[0]] - predictions_raw[sorted_indices[1]]
         
-        # Simple validation - just check if top prediction is clear winner
-        is_valid = top_2_diff >= 0.01  # Just need 1% difference
+        # Simple validation
+        is_valid = top_2_diff >= 0.01
         
-        # Return raw predictions (not sorted) so we can access by index correctly
         return is_valid, predicted_class, predictions_raw, sorted_indices
         
     except Exception as e:
@@ -121,7 +127,8 @@ def speak_result(denomination, language):
             text = f"I've identified this as a {denomination}₹ note. For better results, please capture the picture in good lighting."
             lang = 'en'
         else:
-            hindi_number = st.session_state.hindi_numbers[str(denomination)]
+            session_state = get_session_state()
+            hindi_number = session_state['hindi_numbers'][str(denomination)]
             text = f"मैंने इसे {hindi_number}₹ का नोट पहचाना है। बेहतर परिणामों के लिए, कृपया अच्छी रोशनी में तस्वीर लें।"
             lang = 'hi'
         
@@ -130,20 +137,18 @@ def speak_result(denomination, language):
             tts = gTTS(text=text, lang=lang, slow=False)
             
             # Save to temp file
-            import tempfile
-            import os
             temp_file = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
             temp_path = temp_file.name
             temp_file.close()
             
             tts.save(temp_path)
             
-            # Read and play the audio (keep file temporarily)
+            # Read and play the audio
             with open(temp_path, 'rb') as f:
                 audio_bytes = f.read()
             
             # Play audio in background using HTML audio
-            audio_base64 = __import__('base64').b64encode(audio_bytes).decode()
+            audio_base64 = base64.b64encode(audio_bytes).decode()
             audio_html = f'<audio autoplay><source src="data:audio/mp3;base64,{audio_base64}" type="audio/mpeg"></audio>'
             st.html(audio_html)
             
@@ -162,6 +167,8 @@ def speak_result(denomination, language):
 # Main app
 st.title("🪙 Currency Classifier")
 st.markdown("Classify Indian currency notes using AI")
+
+session_state = get_session_state()
 
 # Language selection
 col1, col2 = st.columns(2)
@@ -183,7 +190,7 @@ if uploaded_file is not None:
             is_valid, predicted_class, predictions, sorted_indices = predict_currency(uploaded_file)
         
         if is_valid and predicted_class is not None:
-            denomination = st.session_state.class_names[predicted_class]
+            denomination = session_state['class_names'][predicted_class]
             
             # Display result
             st.markdown("---")
@@ -193,7 +200,7 @@ if uploaded_file is not None:
             with col1:
                 st.metric("Predicted Denomination", f"₹{denomination}")
             with col2:
-                # Get confidence from raw predictions array (SAME AS TKINTER)
+                # Get confidence from raw predictions array
                 confidence_value = float(predictions[predicted_class])
                 st.metric("Confidence", f"{confidence_value*100:.2f}%")
             
@@ -205,7 +212,7 @@ if uploaded_file is not None:
             for idx in top_3_indices:
                 conf_value = float(predictions[idx])
                 prediction_data.append({
-                    "Denomination": f"₹{st.session_state.class_names[idx]}",
+                    "Denomination": f"₹{session_state['class_names'][idx]}",
                     "Confidence": f"{conf_value*100:.2f}%"
                 })
             
@@ -218,7 +225,4 @@ if uploaded_file is not None:
             st.markdown("---")
             st.error("❌ Unable to make a confident prediction. Please ensure you're using a clear image of an Indian currency note.")
 else:
-    st.info("👆 Upload an image of an Indian currency note to get started")
-
-st.markdown("---")
-st.markdown("<div style='text-align: center; color: gray;'><small>Powered by TensorFlow • Built with Streamlit</small></div>", unsafe_allow_html=True)
+    st.info("👆 Upload an image to get started!")
